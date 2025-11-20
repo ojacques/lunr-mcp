@@ -30,6 +30,7 @@ import asyncio
 import httpx
 from markdownify import markdownify as md
 from fastmcp import FastMCP
+from bs4 import BeautifulSoup
 
 # Parse sites from environment variable
 # Format: "key1=index_url1,key2=index_url2"
@@ -51,7 +52,7 @@ if not SITES:
     @mcp.tool()
     def configuration_required() -> dict:
         """Configuration required - no search indexes configured.
-        
+
         Returns:
             Instructions for configuring the LUNR_SITES environment variable.
         """
@@ -67,7 +68,7 @@ async def fetch_search_index(index_url: str) -> dict:
     """Fetch Lunr.js search index from URL."""
     if index_url in _cache:
         return _cache[index_url]
-    
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(index_url)
         response.raise_for_status()
@@ -76,30 +77,46 @@ async def fetch_search_index(index_url: str) -> dict:
         return data
 
 
+def clean_html(html: str, max_length: int = 100000) -> str:
+    """Extract content starting from h1 tag."""
+    soup = BeautifulSoup(html, 'html.parser')
+    h1 = soup.find('h1')
+
+    if not h1:
+        return md(html, heading_style="ATX")[:max_length]
+
+    content = []
+    for elem in h1.find_all_next():
+        content.append(str(elem))
+
+    markdown = md(''.join([str(h1)] + content), heading_style="ATX")
+    return markdown[:max_length] + (f"\n\n... (truncated)" if len(markdown) > max_length else "")
+
+
 def search_items(index_data: dict | list, query: str, limit: int = 10, base_url: str = "") -> list[dict]:
     """Search through documents in Lunr.js indexes."""
     query_lower = query.lower()
     query_words = query_lower.split()
     results = []
     seen_urls = set()
-    
+
     # Handle both single index dict and array of indexes
     indexes = index_data if isinstance(index_data, list) else [index_data]
-    
+
     for index in indexes:
         for doc in index.get("documents", []):
             title = doc.get("t", "").lower()
             url = doc.get("u", "")
             breadcrumb = doc.get("b", [])
             path = " ".join(breadcrumb).lower()
-            
+
             if query_lower in title or query_lower in path:
                 score = 100
             elif any(word in title or word in path for word in query_words):
                 score = sum(1 for word in query_words if word in title or word in path) * 10
             else:
                 continue
-            
+
             base_url_path = url.split("#")[0]
             if base_url_path not in seen_urls:
                 seen_urls.add(base_url_path)
@@ -109,7 +126,7 @@ def search_items(index_data: dict | list, query: str, limit: int = 10, base_url:
                     "path": breadcrumb,
                     "_score": score
                 })
-    
+
     results.sort(key=lambda x: (-x["_score"], x["title"]))
     return [{"title": r["title"], "url": r["url"], "path": r["path"]} for r in results[:limit]]
 
@@ -118,21 +135,21 @@ def search_items(index_data: dict | list, query: str, limit: int = 10, base_url:
 for site_key, index_url in SITES.items():
     # Derive base URL from index URL (remove /search-index.json or similar)
     base_url = index_url.rsplit("/", 1)[0] if "/" in index_url else index_url
-    
+
     def make_search_tool(idx_url: str, b_url: str, key: str):
         async def search_tool(query: str, limit: int = 10) -> list[dict] | dict:
             # Check if already cached
             if idx_url in _cache:
                 index_data = _cache[idx_url]
                 return search_items(index_data, query, limit, b_url)
-            
+
             # Check if loading is in progress
             if idx_url in _loading:
                 task = _loading[idx_url]
             else:
                 task = asyncio.create_task(fetch_search_index(idx_url))
                 _loading[idx_url] = task
-            
+
             # Wait up to 1.5 seconds
             try:
                 index_data = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
@@ -148,17 +165,17 @@ for site_key, index_url in SITES.items():
                     "path": []
                 }]
         search_tool.__doc__ = f"""Search {key} documentation.
-        
+
         Args:
             query: Search query string
             limit: Maximum number of results to return (default: 10)
-        
+
         Returns:
             List of matching documentation pages with title, url, and path (breadcrumb).
             Always include the url in your response to users.
         """
         return search_tool
-    
+
     def make_get_page_tool(idx_url: str, b_url: str, key: str):
         async def get_page_tool(location: str) -> dict:
             if idx_url in _cache:
@@ -169,7 +186,7 @@ for site_key, index_url in SITES.items():
                 else:
                     task = asyncio.create_task(fetch_search_index(idx_url))
                     _loading[idx_url] = task
-                
+
                 try:
                     index_data = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
                     if idx_url in _loading:
@@ -180,12 +197,12 @@ for site_key, index_url in SITES.items():
                         "title": "Index Loading - Please Retry",
                         "message": f"Search index for {key} is still loading. Please retry in a moment.",
                     }
-            
+
             base_location = location.split("#")[0]
-            
+
             # Handle both single index dict and array of indexes
             indexes = index_data if isinstance(index_data, list) else [index_data]
-            
+
             # Find matching document
             doc = None
             for index in indexes:
@@ -195,18 +212,18 @@ for site_key, index_url in SITES.items():
                         break
                 if doc:
                     break
-            
+
             if not doc:
                 return {"error": f"Page not found: {location}"}
-            
+
             page_url = f"{b_url}{base_location}"
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.get(page_url)
-                    markdown_text = md(response.text, heading_style="ATX") if response.status_code == 200 else f"# {doc.get('t')}\n\nContent not available (HTTP {response.status_code})"
+                    markdown_text = clean_html(response.text) if response.status_code == 200 else f"# {doc.get('t')}\n\nContent not available (HTTP {response.status_code})"
             except Exception as e:
                 markdown_text = f"# {doc.get('t')}\n\nError fetching content: {str(e)}"
-            
+
             return {
                 "title": doc.get("t"),
                 "url": page_url,
@@ -214,22 +231,22 @@ for site_key, index_url in SITES.items():
                 "content": markdown_text,
             }
         get_page_tool.__doc__ = f"""Get the full content of a specific documentation page for {key}.
-        
+
         Args:
             location: Page URL path from search results (e.g., "/docs/get-started/")
-        
+
         Returns:
             Dictionary with title, url, path (breadcrumb), and markdown content.
             Always include the url in your response to users.
         """
         return get_page_tool
-    
+
     # Register tools with descriptive names
     mcp.tool(
         name=f"search_{site_key}",
         description=f"Search {site_key} documentation"
     )(make_search_tool(index_url, base_url, site_key))
-    
+
     mcp.tool(
         name=f"get_{site_key}_page",
         description=f"Get page from {site_key} documentation"
