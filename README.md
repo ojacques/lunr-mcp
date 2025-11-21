@@ -110,6 +110,32 @@ For Windows users, the MCP server configuration format is slightly different:
 |----------|-------------|---------|
 | `FASTMCP_LOG_LEVEL` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) | WARNING |
 | `LUNR_SITES` | Comma-separated list of site configurations in format `key=search_index_url` | (none - required) |
+| `LUNR_MCP_LOG` | Enable file logging to `/tmp/lunr_mcp_*.log` (1, true, yes) | disabled |
+
+## Logging
+
+The server provides two types of logging:
+
+**Client Logging** (always enabled):
+- Sends informational messages to the LLM via MCP protocol
+- Includes operation status, warnings, and errors
+- Helps the LLM understand what's happening
+
+**File Logging** (optional):
+- Disabled by default
+- Enable with `LUNR_MCP_LOG=1` to log to `/tmp/lunr_mcp_YYYYMMDD_HHMMSS.log`
+- Logs all requests, responses, URLs, HTTP status codes, and errors
+- Useful for debugging issues
+
+Example with file logging enabled:
+```json
+{
+  "env": {
+    "LUNR_MCP_LOG": "1",
+    "LUNR_SITES": "mysite=https://your-site.com/search-index.json"
+  }
+}
+```
 
 ## Performance
 

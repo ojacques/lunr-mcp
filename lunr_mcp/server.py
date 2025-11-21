@@ -28,9 +28,25 @@ import os
 from typing import Any
 import asyncio
 import httpx
+import tempfile
+from datetime import datetime
 from markdownify import markdownify as md
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 from bs4 import BeautifulSoup
+
+# Setup logging to temporary file (controlled by LUNR_MCP_LOG environment variable)
+ENABLE_FILE_LOGGING = os.getenv("LUNR_MCP_LOG", "").lower() in ("1", "true", "yes")
+LOG_FILE = os.path.join(tempfile.gettempdir(), f"lunr_mcp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log") if ENABLE_FILE_LOGGING else None
+
+def log_to_file(message: str):
+    """Write log message to temporary file if logging is enabled."""
+    if ENABLE_FILE_LOGGING and LOG_FILE:
+        with open(LOG_FILE, 'a') as f:
+            f.write(f"[{datetime.now().isoformat()}] {message}\n")
+
+if ENABLE_FILE_LOGGING:
+    log_to_file(f"Lunr MCP Server starting - Log file: {LOG_FILE}")
+    print(f"Lunr MCP Server - Logging to: {LOG_FILE}", flush=True)
 
 # Parse sites from environment variable
 # Format: "key1=index_url1,key2=index_url2"
@@ -77,20 +93,20 @@ async def fetch_search_index(index_url: str) -> dict:
         return data
 
 
-def clean_html(html: str, max_length: int = 100000) -> str:
+def clean_html(html: str) -> str:
     """Extract content starting from h1 tag."""
     soup = BeautifulSoup(html, 'html.parser')
     h1 = soup.find('h1')
 
     if not h1:
-        return md(html, heading_style="ATX")[:max_length]
+        return md(html, heading_style="ATX")
 
     content = []
     for elem in h1.find_all_next():
         content.append(str(elem))
 
     markdown = md(''.join([str(h1)] + content), heading_style="ATX")
-    return markdown[:max_length] + (f"\n\n... (truncated)" if len(markdown) > max_length else "")
+    return markdown
 
 
 def search_items(index_data: dict | list, query: str, limit: int = 10, base_url: str = "") -> list[dict]:
@@ -137,16 +153,31 @@ for site_key, index_url in SITES.items():
     base_url = index_url.rsplit("/", 1)[0] if "/" in index_url else index_url
 
     def make_search_tool(idx_url: str, b_url: str, key: str):
-        async def search_tool(query: str, limit: int = 10) -> list[dict] | dict:
+        async def search_tool(query: str, limit: int = 10, ctx: Context = None) -> list[dict] | dict:
+            log_to_file(f"Search request - site: {key}, query: '{query}', limit: {limit}")
+            if ctx:
+                await ctx.info(f"Searching {key} for: '{query}'")
+
             # Check if already cached
             if idx_url in _cache:
+                log_to_file(f"Using cached index for {key}")
+                if ctx:
+                    await ctx.debug(f"Using cached search index for {key}")
                 index_data = _cache[idx_url]
-                return search_items(index_data, query, limit, b_url)
+                results = search_items(index_data, query, limit, b_url)
+                log_to_file(f"Search completed - found {len(results)} results")
+                if ctx:
+                    await ctx.info(f"Found {len(results)} results")
+                return results
 
             # Check if loading is in progress
             if idx_url in _loading:
                 task = _loading[idx_url]
+                log_to_file(f"Index loading in progress for {key}")
             else:
+                log_to_file(f"Starting to load index for {key} from {idx_url}")
+                if ctx:
+                    await ctx.info(f"Loading search index for {key}...")
                 task = asyncio.create_task(fetch_search_index(idx_url))
                 _loading[idx_url] = task
 
@@ -155,8 +186,18 @@ for site_key, index_url in SITES.items():
                 index_data = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
                 if idx_url in _loading:
                     del _loading[idx_url]
-                return search_items(index_data, query, limit, b_url)
+                log_to_file(f"Index loaded successfully for {key}")
+                if ctx:
+                    await ctx.info(f"Search index loaded for {key}")
+                results = search_items(index_data, query, limit, b_url)
+                log_to_file(f"Search completed - found {len(results)} results")
+                if ctx:
+                    await ctx.info(f"Found {len(results)} results")
+                return results
             except asyncio.TimeoutError:
+                log_to_file(f"Index loading timeout for {key} - still loading in background")
+                if ctx:
+                    await ctx.warning(f"Search index for {key} is still loading. Please retry in a moment.")
                 return [{
                     "error": "loading",
                     "title": "Index Loading - Please Retry",
@@ -177,13 +218,22 @@ for site_key, index_url in SITES.items():
         return search_tool
 
     def make_get_page_tool(idx_url: str, b_url: str, key: str):
-        async def get_page_tool(location: str) -> dict:
+        async def get_page_tool(location: str, ctx: Context = None) -> dict:
+            log_to_file(f"Get page request - site: {key}, location: {location}")
+            if ctx:
+                await ctx.info(f"Fetching page from {key}: {location}")
+
             if idx_url in _cache:
                 index_data = _cache[idx_url]
+                log_to_file(f"Using cached index for {key}")
             else:
                 if idx_url in _loading:
                     task = _loading[idx_url]
+                    log_to_file(f"Index loading in progress for {key}")
                 else:
+                    log_to_file(f"Starting to load index for {key}")
+                    if ctx:
+                        await ctx.info(f"Loading search index for {key}...")
                     task = asyncio.create_task(fetch_search_index(idx_url))
                     _loading[idx_url] = task
 
@@ -191,7 +241,11 @@ for site_key, index_url in SITES.items():
                     index_data = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
                     if idx_url in _loading:
                         del _loading[idx_url]
+                    log_to_file(f"Index loaded successfully for {key}")
                 except asyncio.TimeoutError:
+                    log_to_file(f"Index loading timeout for {key}")
+                    if ctx:
+                        await ctx.warning(f"Search index for {key} is still loading. Please retry in a moment.")
                     return {
                         "error": "loading",
                         "title": "Index Loading - Please Retry",
@@ -200,6 +254,15 @@ for site_key, index_url in SITES.items():
 
             base_location = location.split("#")[0]
 
+            # Extract path from URL if full URL was provided
+            if base_location.startswith("http://") or base_location.startswith("https://"):
+                from urllib.parse import urlparse
+                parsed = urlparse(base_location)
+                base_location = parsed.path
+                log_to_file(f"Extracted path from URL: {base_location}")
+                if ctx:
+                    await ctx.debug(f"Extracted path: {base_location}")
+
             # Handle both single index dict and array of indexes
             indexes = index_data if isinstance(index_data, list) else [index_data]
 
@@ -207,21 +270,42 @@ for site_key, index_url in SITES.items():
             doc = None
             for index in indexes:
                 for d in index.get("documents", []):
-                    if d.get("u", "").split("#")[0] == base_location:
+                    doc_path = d.get("u", "").split("#")[0]
+                    if doc_path == base_location:
                         doc = d
+                        log_to_file(f"Found matching document: {doc_path}")
                         break
                 if doc:
                     break
 
             if not doc:
+                log_to_file(f"Page not found - site: {key}, location: {location}, extracted path: {base_location}")
+                if ctx:
+                    await ctx.error(f"Page not found: {location}")
                 return {"error": f"Page not found: {location}"}
 
             page_url = f"{b_url}{base_location}"
+            log_to_file(f"Fetching page content from: {page_url}")
+            if ctx:
+                await ctx.debug(f"Fetching content from URL: {page_url}")
+
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     response = await client.get(page_url)
-                    markdown_text = clean_html(response.text) if response.status_code == 200 else f"# {doc.get('t')}\n\nContent not available (HTTP {response.status_code})"
+                    if response.status_code == 200:
+                        log_to_file(f"Page fetched successfully - status: {response.status_code}")
+                        if ctx:
+                            await ctx.info(f"Page content retrieved successfully")
+                        markdown_text = clean_html(response.text)
+                    else:
+                        log_to_file(f"Page fetch failed - status: {response.status_code}, url: {page_url}")
+                        if ctx:
+                            await ctx.warning(f"Page returned HTTP {response.status_code}")
+                        markdown_text = f"# {doc.get('t')}\n\nContent not available (HTTP {response.status_code})"
             except Exception as e:
+                log_to_file(f"Error fetching page - url: {page_url}, error: {str(e)}")
+                if ctx:
+                    await ctx.error(f"Failed to fetch page: {str(e)}")
                 markdown_text = f"# {doc.get('t')}\n\nError fetching content: {str(e)}"
 
             return {
@@ -233,7 +317,9 @@ for site_key, index_url in SITES.items():
         get_page_tool.__doc__ = f"""Get the full content of a specific documentation page for {key}.
 
         Args:
-            location: Page URL path from search results (e.g., "/docs/get-started/")
+            location: Page URL or path from search results.
+                     Can be a full URL (e.g., "https://example.com/docs/page/")
+                     or just the path (e.g., "/docs/page/")
 
         Returns:
             Dictionary with title, url, path (breadcrumb), and markdown content.
@@ -255,6 +341,9 @@ for site_key, index_url in SITES.items():
 
 def main():
     """Run the MCP server."""
+    log_to_file(f"Starting MCP server with {len(SITES)} configured site(s)")
+    for site_key in SITES:
+        log_to_file(f"  - {site_key}: {SITES[site_key]}")
     mcp.run()
 
 
